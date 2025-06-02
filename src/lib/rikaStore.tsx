@@ -10,6 +10,7 @@ import {
 import { RikaEmotion, RikaAnimation, RikaState } from '@/components/rika/types';
 import { rikaService } from './database';
 import { getCurrentUser } from './supabase';
+import { QuestionClarificationResult } from './openai';
 
 interface RikaContextType {
   // 當前狀態
@@ -25,6 +26,10 @@ interface RikaContextType {
   triggerResponse: (trigger: string) => Promise<void>;
   saveStateToDatabase: () => Promise<void>;
   loadStateFromDatabase: () => Promise<void>;
+
+  // AI 問題澄清功能
+  analyzeQuestion: (question: string, childAge?: number) => Promise<QuestionClarificationResult | null>;
+  processQuestionWithRika: (question: string, childAge?: number) => Promise<void>;
 
   // 預設回應
   getRandomMessage: (emotion?: RikaEmotion) => string;
@@ -77,6 +82,21 @@ const TRIGGER_RESPONSES: Record<
   question_received: {
     emotion: 'curious',
     message: '哇！這是個很棒的問題，讓我想想怎麼回答...',
+    animation: 'think',
+  },
+  question_analyzing: {
+    emotion: 'thinking',
+    message: '正在仔細分析你的問題...',
+    animation: 'sparkle',
+  },
+  question_clarified: {
+    emotion: 'excited',
+    message: '我理解你的問題了！這個問題很棒！',
+    animation: 'celebrate',
+  },
+  question_needs_help: {
+    emotion: 'curious',
+    message: '這個問題有點模糊，讓我幫你整理一下想法...',
     animation: 'think',
   },
   story_generating: {
@@ -156,6 +176,115 @@ export function RikaProvider({ children }: { children: ReactNode }) {
     [updateState, updateMessage, getRandomMessage]
   );
 
+  // AI 問題分析功能
+  const analyzeQuestion = useCallback(async (question: string, childAge?: number): Promise<QuestionClarificationResult | null> => {
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const response = await fetch('/api/clarify-question', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          question,
+          childAge,
+          saveToDatabase: true,
+        }),
+      });
+
+      const data = await response.json();
+
+      if (!response.ok) {
+        throw new Error(data.message || '問題分析失敗');
+      }
+
+      return data.result;
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : '未知錯誤';
+      setError(errorMessage);
+      console.error('問題分析錯誤:', err);
+      return null;
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  // 完整的問題處理流程（包含 Rika 互動）
+  const processQuestionWithRika = useCallback(async (question: string, childAge?: number) => {
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      // 步驟 1: Rika 收到問題
+      await triggerResponse('question_received');
+      await new Promise(resolve => setTimeout(resolve, 1500)); // 等待動畫
+
+      // 步驟 2: 開始分析
+      await triggerResponse('question_analyzing');
+      
+      // 步驟 3: 執行 AI 分析
+      const result = await analyzeQuestion(question, childAge);
+      
+      if (!result) {
+        updateState({
+          emotion: 'thinking',
+          message: '抱歉，我在理解這個問題時遇到了困難。可以換個方式問問看嗎？',
+          animation: 'think',
+        });
+        return;
+      }
+
+      // 步驟 4: 根據分析結果回應
+      if (result.needsClarification) {
+        await triggerResponse('question_needs_help');
+        
+        // 提供澄清建議
+        const clarificationText = result.clarificationPrompts && result.clarificationPrompts.length > 0
+          ? `你可以這樣問：\n${result.clarificationPrompts.slice(0, 2).join('\n或：')}`
+          : '你可以提供更多細節，這樣我就能為你創作更精彩的故事！';
+          
+        setTimeout(() => {
+          updateState({
+            emotion: 'curious',
+            message: clarificationText,
+            animation: 'wave',
+          });
+        }, 2000);
+      } else {
+        await triggerResponse('question_clarified');
+        
+        // 顯示分析結果和建議
+        setTimeout(() => {
+          let responseMessage = `我理解了！這是個關於${getCategoryName(result.category)}的問題。`;
+          
+          if (result.qualityScore >= 8) {
+            responseMessage += '\n這個問題很棒，我們可以創作一個精彩的故事！';
+          } else if (result.qualityScore >= 6) {
+            responseMessage += '\n這是個不錯的問題！';
+          }
+
+          updateState({
+            emotion: result.qualityScore >= 7 ? 'excited' : 'happy',
+            message: responseMessage,
+            animation: result.qualityScore >= 8 ? 'celebrate' : 'bounce',
+          });
+        }, 2000);
+      }
+
+    } catch (err) {
+      setError('處理問題時發生錯誤');
+      updateState({
+        emotion: 'thinking',
+        message: '抱歉，我遇到了一些技術問題。請稍後再試試看！',
+        animation: 'think',
+      });
+    } finally {
+      setIsLoading(false);
+    }
+  }, [analyzeQuestion, triggerResponse, updateState]);
+
   // 保存狀態到資料庫
   const saveStateToDatabase = useCallback(async () => {
     setIsLoading(true);
@@ -232,6 +361,8 @@ export function RikaProvider({ children }: { children: ReactNode }) {
     updateAnimation,
     updateState,
     triggerResponse,
+    analyzeQuestion,
+    processQuestionWithRika,
     saveStateToDatabase,
     loadStateFromDatabase,
     getRandomMessage,
@@ -242,27 +373,39 @@ export function RikaProvider({ children }: { children: ReactNode }) {
   return <RikaContext.Provider value={value}>{children}</RikaContext.Provider>;
 }
 
-// Hook 使用 Rika Context
-export function useRika() {
+// Hook 來使用 Rika Context
+export const useRika = () => {
   const context = useContext(RikaContext);
   if (context === undefined) {
     throw new Error('useRika must be used within a RikaProvider');
   }
   return context;
-}
+};
 
-// 便利的 Hooks
-export function useRikaEmotion() {
+// 便利 Hooks
+export const useRikaEmotion = () => {
   const { currentState, updateEmotion } = useRika();
   return [currentState.emotion, updateEmotion] as const;
-}
+};
 
-export function useRikaMessage() {
+export const useRikaMessage = () => {
   const { currentState, updateMessage } = useRika();
   return [currentState.message, updateMessage] as const;
-}
+};
 
-export function useRikaAnimation() {
+export const useRikaAnimation = () => {
   const { currentState, updateAnimation } = useRika();
   return [currentState.animation, updateAnimation] as const;
+};
+
+// 輔助函數：獲取分類中文名稱
+function getCategoryName(category: string): string {
+  const categories: Record<string, string> = {
+    science: '科學',
+    life: '生活',
+    emotion: '情感',
+    nature: '自然',
+    other: '其他',
+  };
+  return categories[category] || '未知';
 }
